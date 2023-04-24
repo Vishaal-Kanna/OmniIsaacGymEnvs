@@ -201,9 +201,14 @@ class Franka_(RLTask):
         franka_local_pose_pos += torch.tensor([0, 0.04, 0], device=self._device)
         self.franka_local_grasp_pos = franka_local_pose_pos.repeat((self._num_envs, 1))
         self.franka_local_grasp_rot = franka_local_grasp_pose_rot.repeat((self._num_envs, 1))
+        
+        drawer_local_grasp_pose = torch.tensor([0.0, 0.01, 0.2, 1.0, 0.0, 0.0, 0.0], device=self._device)
+        self.drawer_local_grasp_pos = drawer_local_grasp_pose[0:3].repeat((self._num_envs, 1))
+        self.drawer_local_grasp_rot = drawer_local_grasp_pose[3:7].repeat((self._num_envs, 1))
 
-        self.gripper_forward_axis = torch.tensor([0, 0, 1], device=self._device, dtype=torch.float).repeat(
-            (self._num_envs, 1))
+        self.gripper_up_axis = torch.tensor([0, 1, 0], device=self._device, dtype=torch.float).repeat((self._num_envs, 1))
+        self.drawer_up_axis = torch.tensor([0, 0, 1], device=self._device, dtype=torch.float).repeat((self._num_envs, 1))
+
 
         self.franka_default_dof_pos = torch.tensor(
             [1.157, -1.066, -0.155, -2.239, -1.841, 1.003, 0.469, 0.035, 0.035], device=self._device
@@ -214,7 +219,8 @@ class Franka_(RLTask):
 
     def post_reset(self):
         self.num_franka_dofs = self._franka.num_dof
-        self.target = torch.zeros([self._franka.count,3]).cuda()
+        self.target = torch.zeros([self._franka.count, 3]).cuda()
+        self.target_rot = torch.zeros([self._franka.count, 4]).cuda()
 
         self.franka_dof_pos = torch.zeros((self._franka.count, self.num_franka_dofs), device=self._device)
         dof_limits = self._franka.get_dof_limits()
@@ -229,9 +235,14 @@ class Franka_(RLTask):
         self.default_cube_pos, self.default_cube_rot = self._cube.get_world_poses()
         self.cube_indices = torch.arange(self._num_envs * 1, device=self._device).view(self._num_envs, 1)
 
-        self.target[:, 0] = self.default_cube_pos[:, 0] + 0.25
-        self.target[:, 1] = self.default_cube_pos[:, 1] + 0.25
-        self.target[:, 2] = self.default_cube_pos[:, 2]
+        self.target[:, 0] = self.default_cube_pos[:, 0]
+        self.target[:, 1] = self.default_cube_pos[:, 1]
+        self.target[:, 2] = self.default_cube_pos[:, 2] + 0.5
+        
+        self.target_rot[:, 0] = -1.0
+        self.target_rot[:, 1] = 0.0
+        self.target_rot[:, 2] = 0.0
+        self.target_rot[:, 3] = 0.0
 
         # randomize all envs
         indices = torch.arange(self._franka.count, dtype=torch.int64, device=self._device)
@@ -247,6 +258,17 @@ class Franka_(RLTask):
 
         self.franka_lfinger_pos, self.franka_lfinger_rot = self._franka._lfingers.get_world_poses(clone=False)
         self.franka_rfinger_pos, self.franka_rfinger_rot = self._franka._lfingers.get_world_poses(clone=False)
+        
+        self.franka_grasp_rot, self.franka_grasp_pos, self.drawer_grasp_rot, self.drawer_grasp_pos = self.compute_grasp_transforms(
+            self.hand_rot,
+            self.hand_pos,
+            self.franka_local_grasp_rot,
+            self.franka_local_grasp_pos,
+            self.cube_orientation,
+            self.cube_position,
+            self.drawer_local_grasp_rot,
+            self.drawer_local_grasp_pos,
+        )
 
         dof_pos_scaled = (
                 2.0
@@ -254,12 +276,12 @@ class Franka_(RLTask):
                 / (self.franka_dof_upper_limits - self.franka_dof_lower_limits)
                 - 1.0
         )
-        to_target = self.cube_position - self.hand_pos #(self.franka_lfinger_pos + self.franka_rfinger_pos)/2.0
+        to_target = self.drawer_grasp_pos - self.franka_grasp_pos
         self.obs_buf = torch.cat(
             (
                 dof_pos_scaled,
                 franka_dof_vel * self.dof_vel_scale,
-                to_target,
+                to_target,             
             ),
             dim=-1,
         )
@@ -270,6 +292,27 @@ class Franka_(RLTask):
             }
         }
         return observations
+        
+    def compute_grasp_transforms(
+        self,
+        hand_rot,
+        hand_pos,
+        franka_local_grasp_rot,
+        franka_local_grasp_pos,
+        drawer_rot,
+        drawer_pos,
+        drawer_local_grasp_rot,
+        drawer_local_grasp_pos,
+    ):
+
+        global_franka_rot, global_franka_pos = tf_combine(
+            hand_rot, hand_pos, franka_local_grasp_rot, franka_local_grasp_pos
+        )
+        global_drawer_rot, global_drawer_pos = tf_combine(
+            drawer_rot, drawer_pos, drawer_local_grasp_rot, drawer_local_grasp_pos
+        )
+
+        return global_franka_rot, global_franka_pos, global_drawer_rot, global_drawer_pos
 
     def pre_physics_step(self, actions) -> None:
         if not self._env._world.is_playing():
@@ -326,25 +369,31 @@ class Franka_(RLTask):
         # self.cube_position -= self._env_pos[0]
         # gripper_position -= self._env_pos[0]
 
-        d1 = torch.norm(self.hand_pos - self.cube_position, p=2, dim=-1)
+        d1 = torch.norm(self.franka_grasp_pos - self.drawer_grasp_pos, p=2, dim=-1)
         dist_reward1 = 1.0 / (1.0 + d1 ** 2)
         dist_reward1 *= dist_reward1
         dist_reward1 = torch.where(d1 <= 0.02, dist_reward1 * 2, dist_reward1)
+        
+        # axis1 = tf_vector(franka_grasp_rot, gripper_forward_axis)
+        # axis2 = tf_vector(drawer_grasp_rot, drawer_inward_axis)
+        axis3 = tf_vector(self.franka_grasp_rot, self.gripper_up_axis)
+        axis4 = tf_vector(self.drawer_grasp_rot, self.drawer_up_axis)
+        
+        # dot1 = torch.bmm(axis1.view(num_envs, 1, 3), axis2.view(num_envs, 3, 1)).squeeze(-1).squeeze(-1)  # alignment of forward axis for gripper
+        dot1 = torch.bmm(axis3.view(self._num_envs, 1, 3), axis4.view(self._num_envs, 3, 1)).squeeze(-1).squeeze(-1)  # alignment of up axis for gripper
 
-        rot = (torch.bmm(self.hand_rot.view(self._num_envs, 1, 4), -1.0*self.default_cube_rot.view(self._num_envs, 4, 1)).squeeze(-1)).squeeze(-1)
+        #rot = (torch.bmm(self.franka_lfinger_rot.view(self._num_envs, 1, 4), self.target_rot.view(self._num_envs, 4, 1)).squeeze(-1)).squeeze(-1)
         # print(rot.shape)
         # quit()
         # rot_reward = 1.0 / (1.0 + rot ** 2)
         # rot_reward *= rot_reward
         # rot_reward = torch.where(d1 <= 0.02, rot_reward * 2, rot_reward)
-        rot_reward = 0.5 * torch.sign(rot)*(rot ** 2)
+        rot_reward = 0.5 * (torch.sign(dot1) * dot1 ** 2)
 
         finger_close_reward = torch.zeros_like(rot_reward)
         finger_close_reward = torch.where(d1 <=0.03, (0.04 - self.franka_dof_pos[:, 7]) + (0.04 - self.franka_dof_pos[:, 8]), finger_close_reward)
 
-
-
-        d2 = torch.norm(self.cube_position - self.target, p=2, dim=-1)
+        d2 = torch.norm((self.franka_lfinger_pos + self.franka_lfinger_pos)/2.0 - self.target, p=2, dim=-1)
         dist_reward2 = 1.0 / (1.0 + d2 ** 2)
         dist_reward2 *= dist_reward2
         dist_reward2 = torch.where(d2 <= 0.02, dist_reward2 * 2, dist_reward2)
@@ -356,8 +405,7 @@ class Franka_(RLTask):
 
         action_penalty = torch.sum(self.actions ** 2, dim=-1)
 
-        rewards = self.dist_reward_scale * (dist_reward1 + dist_reward2)
-                  # + self.rot_reward_scale * rot_reward \
+        rewards = self.rot_reward_scale * rot_reward + self.dist_reward_scale * (dist_reward1) #- self.action_penalty_scale * action_penalty + 
                   # + self.finger_close_reward_scale * finger_close_reward - self.action_penalty_scale * action_penalty # + dist_reward2) #- self.action_penalty_scale * action_penalty
 
         self.rew_buf[:] = rewards

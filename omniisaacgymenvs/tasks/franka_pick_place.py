@@ -12,6 +12,7 @@ from omniisaacgymenvs.robots.articulations.franka import Franka
 from omniisaacgymenvs.robots.articulations.cabinet import Cabinet
 from omniisaacgymenvs.robots.articulations.views.franka_view import FrankaView
 from omniisaacgymenvs.robots.articulations.views.cabinet_view import CabinetView
+from omniisaacgymenvs.tasks.factory.factory_control import *
 
 from omni.isaac.core.objects import DynamicCuboid
 from omni.isaac.core.prims import RigidPrim, RigidPrimView
@@ -59,6 +60,7 @@ class Franka_(RLTask):
         self.finger_dist_reward_scale = self._task_cfg["env"]["fingerDistRewardScale"]
         self.action_penalty_scale = self._task_cfg["env"]["actionPenaltyScale"]
         self.finger_close_reward_scale = self._task_cfg["env"]["fingerCloseRewardScale"]
+        self.franka_finger_length = 0.053671
 
         self.distX_offset = 0.04
         self.dt = 1 / 60.
@@ -189,7 +191,7 @@ class Franka_(RLTask):
         self.cubeA_to_cubeB_pos = self.cubeB_pos - self.cubeA_pos
 
         self.franka_lfinger_pos, self.franka_lfinger_rot = self._frankas._lfingers.get_world_poses(clone=False)
-        self.franka_rfinger_pos, self.franka_rfinger_rot = self._frankas._lfingers.get_world_poses(clone=False)
+        self.franka_rfinger_pos, self.franka_rfinger_rot = self._frankas._rfingers.get_world_poses(clone=False)
 
         dof_pos_scaled = (
                 2.0
@@ -227,11 +229,129 @@ class Franka_(RLTask):
             self.reset_idx(reset_env_ids)
 
         self.actions = actions.clone().to(self._device)
-        targets = self.franka_dof_targets + self.franka_dof_speed_scales * self.dt * self.actions * self.action_scale
-        self.franka_dof_targets[:] = tensor_clamp(targets, self.franka_dof_lower_limits, self.franka_dof_upper_limits)
+
+        self.franka_dof_targets = self.compute_dof_pos_target(self.franka_dof_pos[:,0:7], self.finger_midpoint_pos,
+                                   self.fingertip_midpoint_quat,
+                                   self.fingertip_midpoint_jacobian,
+                                   self.actions[:,0:3],
+                                   self.actions[:,3:7],
+                                   self.actions[:,7:9],
+                                   self._device)
+
+        # targets = self.franka_dof_targets + self.franka_dof_speed_scales * self.dt * self.actions * self.action_scale
+        # self.franka_dof_targets[:] = tensor_clamp(targets, self.franka_dof_lower_limits, self.franka_dof_upper_limits)
         env_ids_int32 = torch.arange(self._frankas.count, dtype=torch.int32, device=self._device)
 
         self._frankas.set_joint_position_targets(self.franka_dof_targets, indices=env_ids_int32)
+
+    def compute_dof_pos_target(self, arm_dof_pos,
+                               fingertip_midpoint_pos,
+                               fingertip_midpoint_quat,
+                               jacobian,
+                               ctrl_target_fingertip_midpoint_pos,
+                               ctrl_target_fingertip_midpoint_quat,
+                               ctrl_target_gripper_dof_pos,
+                               device):
+        """Compute Franka DOF position target to move fingertips towards target pose."""
+
+        ctrl_target_dof_pos = torch.zeros((self._num_envs, 9), device=device)
+
+        pos_error, axis_angle_error = self.get_pose_error(
+            fingertip_midpoint_pos=fingertip_midpoint_pos,
+            fingertip_midpoint_quat=fingertip_midpoint_quat,
+            ctrl_target_fingertip_midpoint_pos=ctrl_target_fingertip_midpoint_pos,
+            ctrl_target_fingertip_midpoint_quat=ctrl_target_fingertip_midpoint_quat,
+            jacobian_type='geometric',
+            rot_error_type='axis_angle')
+
+        delta_fingertip_pose = torch.cat((pos_error, axis_angle_error), dim=1)
+        delta_arm_dof_pos = self._get_delta_dof_pos(delta_pose=delta_fingertip_pose,
+                                               ik_method='pinv',
+                                               jacobian=jacobian,
+                                               device=device)
+
+        ctrl_target_dof_pos[:, 0:7] = arm_dof_pos + delta_arm_dof_pos
+        ctrl_target_dof_pos[:, 7:9] = ctrl_target_gripper_dof_pos  # gripper finger joints
+
+        return ctrl_target_dof_pos
+
+    def _get_delta_dof_pos(self,delta_pose, ik_method, jacobian, device):
+        """Get delta Franka DOF position from delta pose using specified IK method."""
+        # References:
+        # 1) https://www.cs.cmu.edu/~15464-s13/lectures/lecture6/iksurvey.pdf
+        # 2) https://ethz.ch/content/dam/ethz/special-interest/mavt/robotics-n-intelligent-systems/rsl-dam/documents/RobotDynamics2018/RD_HS2018script.pdf (p. 47)
+
+        if ik_method == 'pinv':  # Jacobian pseudoinverse
+            k_val = 1.0
+            jacobian_pinv = torch.linalg.pinv(jacobian)
+            delta_dof_pos = k_val * jacobian_pinv @ delta_pose.unsqueeze(-1)
+            delta_dof_pos = delta_dof_pos.squeeze(-1)
+
+        elif ik_method == 'trans':  # Jacobian transpose
+            k_val = 1.0
+            jacobian_T = torch.transpose(jacobian, dim0=1, dim1=2)
+            delta_dof_pos = k_val * jacobian_T @ delta_pose.unsqueeze(-1)
+            delta_dof_pos = delta_dof_pos.squeeze(-1)
+
+        elif ik_method == 'dls':  # damped least squares (Levenberg-Marquardt)
+            lambda_val = 0.1
+            jacobian_T = torch.transpose(jacobian, dim0=1, dim1=2)
+            lambda_matrix = (lambda_val ** 2) * torch.eye(n=jacobian.shape[1], device=device)
+            delta_dof_pos = jacobian_T @ torch.inverse(jacobian @ jacobian_T + lambda_matrix) @ delta_pose.unsqueeze(-1)
+            delta_dof_pos = delta_dof_pos.squeeze(-1)
+
+        elif ik_method == 'svd':  # adaptive SVD
+            k_val = 1.0
+            U, S, Vh = torch.linalg.svd(jacobian)
+            S_inv = 1. / S
+            min_singular_value = 1.0e-5
+            S_inv = torch.where(S > min_singular_value, S_inv, torch.zeros_like(S_inv))
+            jacobian_pinv = torch.transpose(Vh, dim0=1, dim1=2)[:, :, :6] @ torch.diag_embed(S_inv) @ torch.transpose(U,
+                                                                                                                      dim0=1,
+                                                                                                                      dim1=2)
+            delta_dof_pos = k_val * jacobian_pinv @ delta_pose.unsqueeze(-1)
+            delta_dof_pos = delta_dof_pos.squeeze(-1)
+
+        return delta_dof_pos
+
+    def get_pose_error(self, fingertip_midpoint_pos,
+                       fingertip_midpoint_quat,
+                       ctrl_target_fingertip_midpoint_pos,
+                       ctrl_target_fingertip_midpoint_quat,
+                       jacobian_type,
+                       rot_error_type):
+        """Compute task-space error between target Franka fingertip pose and current pose."""
+        # Reference: https://ethz.ch/content/dam/ethz/special-interest/mavt/robotics-n-intelligent-systems/rsl-dam/documents/RobotDynamics2018/RD_HS2018script.pdf
+
+        # Compute pos error
+        # print(ctrl_target_fingertip_midpoint_pos.shape)
+        # print(fingertip_midpoint_pos.shape)
+        # quit()
+        pos_error = ctrl_target_fingertip_midpoint_pos - fingertip_midpoint_pos
+
+        # Compute rot error
+        if jacobian_type == 'geometric':  # See example 2.9.8; note use of J_g and transformation between rotation vectors
+            # Compute quat error (i.e., difference quat)
+            # Reference: https://personal.utdallas.edu/~sxb027100/dock/quat.html
+            fingertip_midpoint_quat_norm = torch_utils.quat_mul(fingertip_midpoint_quat,
+                                                                torch_utils.quat_conjugate(fingertip_midpoint_quat))[:,
+                                           0]  # scalar component
+            fingertip_midpoint_quat_inv = torch_utils.quat_conjugate(
+                fingertip_midpoint_quat) / fingertip_midpoint_quat_norm.unsqueeze(-1)
+            quat_error = torch_utils.quat_mul(ctrl_target_fingertip_midpoint_quat, fingertip_midpoint_quat_inv)
+
+            # Convert to axis-angle error
+            axis_angle_error = axis_angle_from_quat(quat_error)
+
+        elif jacobian_type == 'analytic':  # See example 2.9.7; note use of J_a and difference of rotation vectors
+            # Compute axis-angle error
+            axis_angle_error = axis_angle_from_quat(ctrl_target_fingertip_midpoint_quat) \
+                               - axis_angle_from_quat(fingertip_midpoint_quat)
+
+        if rot_error_type == 'quat':
+            return pos_error, quat_error
+        elif rot_error_type == 'axis_angle':
+            return pos_error, axis_angle_error
 
     def reset_idx(self, env_ids):
         indices = env_ids.to(dtype=torch.int32)
@@ -258,9 +378,89 @@ class Franka_(RLTask):
         self._frankas.set_joint_positions(dof_pos, indices=indices)
         self._frankas.set_joint_velocities(dof_vel, indices=indices)
 
+        self.dof_pos = self._frankas.get_joint_positions(clone=False)
+        self.dof_vel = self._frankas.get_joint_velocities(clone=False)
+
+        # jacobian shape: [4, 11, 6, 9] (The root does not have a jacobian)
+        self.franka_jacobian = self._frankas._physics_view.get_jacobians()
+        self.franka_mass_matrix = self._frankas.get_mass_matrices(clone=False)
+
+        self.arm_dof_pos = self.dof_pos[:, 0:7]
+        self.arm_mass_matrix = self.franka_mass_matrix[:, 0:7, 0:7]  # for Franka arm (not gripper)
+
+        self.hand_pos, self.hand_quat = self._frankas._hands.get_world_poses(clone=False)
+        # subtract from the env positions to obtain the positions relative to the envs
+        self.hand_pos -= self._env_pos
+        hand_velocities = self._frankas._hands.get_velocities(clone=False)
+        self.hand_linvel = hand_velocities[:, 0:3]
+        self.hand_angvel = hand_velocities[:, 3:6]
+
+        self.left_finger_pos, self.left_finger_quat = self._frankas._lfingers.get_world_poses(clone=False)
+        self.left_finger_pos -= self.env_pos
+        left_finger_velocities = self._frankas._lfingers.get_velocities(clone=False)
+        self.left_finger_linvel = left_finger_velocities[:, 0:3]
+        self.left_finger_angvel = left_finger_velocities[:, 3:6]
+        self.left_finger_jacobian = self.franka_jacobian[:, 8, 0:6, 0:7]
+
+        self.right_finger_pos, self.right_finger_quat = self._frankas._rfingers.get_world_poses(clone=False)
+        self.right_finger_pos -= self.env_pos
+        right_finger_velocities = self._frankas._rfingers.get_velocities(clone=False)
+        self.right_finger_linvel = right_finger_velocities[:, 0:3]
+        self.right_finger_angvel = right_finger_velocities[:, 3:6]
+        self.right_finger_jacobian = self.franka_jacobian[:, 9, 0:6, 0:7]
+
+        # Cannot acquire proper net contact force in Isaac Sim at this moment
+        self.left_finger_force = torch.zeros((self.num_envs, 3), device=self.device)
+        self.right_finger_force = torch.zeros((self.num_envs, 3), device=self.device)
+
+        self.gripper_dof_pos = self.dof_pos[:, 7:9]
+
+        # self.fingertip_centered_pos, self.fingertip_centered_quat = self._frankas._fingertip_centered.get_world_poses(
+        #     clone=False)
+        # self.fingertip_centered_pos -= self.env_pos
+        # fingertip_centered_velocities = self._frankas._fingertip_centered.get_velocities(clone=False)
+        # self.fingertip_centered_linvel = fingertip_centered_velocities[:, 0:3]
+        # self.fingertip_centered_angvel = fingertip_centered_velocities[:, 3:6]
+        # self.fingertip_centered_jacobian = self.franka_jacobian[:, 10, 0:6, 0:7]
+
+        self.finger_midpoint_pos = (self.left_finger_pos + self.right_finger_pos) / 2
+        self.fingertip_midpoint_pos = self.translate_along_local_z(pos=self.finger_midpoint_pos,
+                                                                 quat=self.hand_quat,
+                                                                 offset=self.franka_finger_length,
+                                                                 device=self.device)
+        self.fingertip_midpoint_quat = (self.left_finger_quat + self.right_finger_quat) / 2
+
+        # TODO: Add relative velocity term (see https://dynamicsmotioncontrol487379916.files.wordpress.com/2020/11/21-me258pointmovingrigidbody.pdf)
+        # self.fingertip_midpoint_linvel = self.fingertip_centered_linvel + torch.cross(self.fingertip_centered_angvel,
+        #                                                                               (
+        #                                                                                           self.fingertip_midpoint_pos - self.fingertip_centered_pos),
+        #                                                                               dim=1)
+
+        # From sum of angular velocities (https://physics.stackexchange.com/questions/547698/understanding-addition-of-angular-velocity),
+        # angular velocity of midpoint w.r.t. world is equal to sum of
+        # angular velocity of midpoint w.r.t. hand and angular velocity of hand w.r.t. world.
+        # Midpoint is in sliding contact (i.e., linear relative motion) with hand; angular velocity of midpoint w.r.t. hand is zero.
+        # Thus, angular velocity of midpoint w.r.t. world is equal to angular velocity of hand w.r.t. world.
+        # self.fingertip_midpoint_angvel = self.fingertip_centered_angvel  # always equal
+
+        self.fingertip_midpoint_jacobian = (self.left_finger_jacobian + self.right_finger_jacobian) * 0.5
+
         # bookkeeping
         self.reset_buf[env_ids] = 0
         self.progress_buf[env_ids] = 0
+
+    def translate_along_local_z(self, pos, quat, offset, device):
+        """Translate global body position along local Z-axis and express in global coordinates."""
+
+        num_vecs = pos.shape[0]
+        offset_vec = offset * torch.tensor([0.0, 0.0, 1.0], device=device).repeat((num_vecs, 1))
+        _, translated_pos = torch_utils.tf_combine(q1=quat,
+                                                   t1=pos,
+                                                   q2=torch.tensor([1.0, 0.0, 0.0, 0.0], device=device).repeat(
+                                                       (num_vecs, 1)),
+                                                   t2=offset_vec)
+
+        return translated_pos
 
     def post_reset(self):
 
@@ -280,7 +480,7 @@ class Franka_(RLTask):
 
         self.default_cubeA_pos += torch.tensor([-0.55, 0.0, 0.0]).cuda()
         self.default_cubeB_pos += torch.tensor([0.5, 0.0, 0.0]).cuda()
-
+        self.env_pos = self._env_pos
         # randomize all envs
         indices = torch.arange(self._num_envs, dtype=torch.int64, device=self._device)
         self.reset_idx(indices)
